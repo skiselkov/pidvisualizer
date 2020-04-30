@@ -1,22 +1,35 @@
 /*
- * CONFIDENTIAL
+ * CDDL HEADER START
  *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License, Version 1.0 only
+ * (the "License").  You may not use this file except in compliance
+ * with the License.
+ *
+ * You can obtain a copy of the license in the file COPYING
+ * or http://www.opensource.org/licenses/CDDL-1.0.
+ * See the License for the specific language governing permissions
+ * and limitations under the License.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the License file COPYING.
+ * If applicable, add the following below this CDDL HEADER, with the
+ * fields enclosed by brackets "[]" replaced with your own identifying
+ * information: Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
  * Copyright 2020 Saso Kiselkov. All rights reserved.
- *
- * NOTICE:  All information contained herein is, and remains the property
- * of Saso Kiselkov. The intellectual and technical concepts contained
- * herein are proprietary to Saso Kiselkov and may be covered by U.S. and
- * Foreign Patents, patents in process, and are protected by trade secret
- * or copyright law. Dissemination of this information or reproduction of
- * this material is strictly forbidden unless prior written permission is
- * obtained from Saso Kiselkov.
  */
 
 #include <stddef.h>
 
 #include <XPLMDisplay.h>
+#include <XPLMProcessing.h>
 
 #include <acfutils/assert.h>
+#include <acfutils/dr.h>
 #include <acfutils/list.h>
 #include <acfutils/mt_cairo_render.h>
 
@@ -32,19 +45,25 @@ typedef struct {
 } sample_t;
 
 typedef enum {
-	DATA_SEL_ERR_P =	1 << 0,
-	DATA_SEL_ERR_I =	1 << 1,
-	DATA_SEL_ERR_D =	1 << 2,
-	DATA_SEL_K_P =		1 << 3,
-	DATA_SEL_K_I =		1 << 4,
-	DATA_SEL_LIM_I =	1 << 5,
-	DATA_SEL_K_D =		1 << 6,
-	DATA_SEL_R_D =		1 << 7
-#define	DATA_SEL_MAX_BIT	8
+	DATA_SEL_P,
+	DATA_SEL_I,
+	DATA_SEL_D,
+	DATA_SEL_E_P,
+	DATA_SEL_E_I,
+	DATA_SEL_E_D,
+	DATA_SEL_K_P,
+	DATA_SEL_K_I,
+	DATA_SEL_LIM_I,
+	DATA_SEL_K_D,
+	DATA_SEL_R_D,
+	DATA_SEL_MAX_BIT
 } data_sel_t;
 
 struct pidvis_s {
-	data_sel_t		data_sel;
+	uint32_t		data_sel_mask;
+	bool			reset;
+	bool			paused;
+	dr_t			sim_speed_dr;
 	list_t			samples;
 	pid_ctl_t		*pid;
 	int			mtcr_w;
@@ -54,6 +73,21 @@ struct pidvis_s {
 	XPLMWindowID		win;
 };
 
+static float
+floop_cb(float unused1, float unused2, int unused3, void *refcon)
+{
+	pidvis_t *vis;
+
+	UNUSED(unused1);
+	UNUSED(unused2);
+	UNUSED(unused3);
+	ASSERT(refcon != NULL);
+	vis = refcon;
+	vis->paused = (dr_geti(&vis->sim_speed_dr) == 0);
+
+	return (-1);
+}
+
 static void
 sample_pid(pidvis_t *vis)
 {
@@ -62,6 +96,16 @@ sample_pid(pidvis_t *vis)
 	ASSERT(vis != NULL);
 	ASSERT(vis->pid != NULL);
 	memcpy(&sample->data, vis->pid, sizeof (sample->data));
+
+	if (isnan(sample->data.e_prev)) {
+		vis->reset = true;
+		/* PID is reset, empty out our queue */
+		free(sample);
+		while ((sample = list_remove_head(&vis->samples)) != NULL)
+			free(sample);
+		return;
+	}
+	vis->reset = false;
 	list_insert_tail(&vis->samples, sample);
 
 	while (list_count(&vis->samples) > MAX_SAMPLES) {
@@ -71,20 +115,26 @@ sample_pid(pidvis_t *vis)
 }
 
 static inline double
-data_get(const sample_t *sample, int bit_nr)
+data_get(const sample_t *sample, data_sel_t data_sel)
 {
 	const pid_ctl_t *pid;
 
 	ASSERT(sample != NULL);
 	pid = &sample->data;
 
-	switch (1 << bit_nr) {
-	case DATA_SEL_ERR_P:
+	switch (data_sel) {
+	case DATA_SEL_P:
 		return (pid->k_p * pid->e_prev);
-	case DATA_SEL_ERR_I:
+	case DATA_SEL_I:
 		return (pid->k_i * pid->e_integ);
-	case DATA_SEL_ERR_D:
+	case DATA_SEL_D:
 		return (pid->k_d * pid->e_deriv);
+	case DATA_SEL_E_P:
+		return (pid->e_prev);
+	case DATA_SEL_E_I:
+		return (pid->e_integ);
+	case DATA_SEL_E_D:
+		return (pid->e_deriv);
 	case DATA_SEL_K_P:
 		return (pid->k_p);
 	case DATA_SEL_K_I:
@@ -113,19 +163,25 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 	pidvis_t *vis;
 	double minval = 0, maxval = 0;
 	const double colors[DATA_SEL_MAX_BIT][3] = {
-	    {1, 0, 0},
-	    {0, 0.8, 0},
-	    {0, 0, 1},
-	    {1, 1, 0},
-	    {1, 0, 1},
-	    {0, 1, 1},
-	    {0.8, 0.5, 0},
-	    {0.8, 0, 0.5}
+	    {1, 0, 0},		/* P */
+	    {0, 0.8, 0},	/* I */
+	    {0, 0, 1},		/* D */
+	    {1, 0, 0},		/* Ep */
+	    {0, 0.8, 0},	/* Ei */
+	    {0, 0, 1},		/* Ed */
+	    {1, 1, 0},		/* Kp */
+	    {1, 0, 1},		/* Ki */
+	    {0, 1, 1},		/* Li */
+	    {0.8, 0.5, 0},	/* Kd */
+	    {0.8, 0, 0.5}	/* Rd */
 	};
 	const char *data_sel_names[DATA_SEL_MAX_BIT] = {
 	    "P",
 	    "I",
 	    "D",
+	    "Ep",
+	    "Ei",
+	    "Ed",
 	    "Kp",
 	    "Ki",
 	    "Li",
@@ -137,6 +193,8 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 	UNUSED(h);
 	ASSERT(userinfo != NULL);
 	vis = userinfo;
+
+	cairo_set_font_size(cr, 15);
 	/*
 	 * Draws the white background.
 	 */
@@ -145,22 +203,31 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 	/*
 	 * Grab a fresh sample every draw cycle.
 	 */
-	sample_pid(vis);
+	if (!vis->paused)
+		sample_pid(vis);
+	if (vis->reset) {
+		cairo_text_extents_t te;
+		cairo_text_extents(cr, "PID reset", &te);
+		cairo_set_source_rgb(cr, 1, 0, 0);
+		cairo_move_to(cr, w / 2 - te.width / 2,
+		    h / 2 - te.height / 2 - te.y_bearing);
+		cairo_show_text(cr, "PID reset");
+		return;
+	}
 	/*
 	 * Determine the min/max values to figure out the scale we
 	 * need to apply.
 	 */
-	for (int data_sel_bit = 0; data_sel_bit < DATA_SEL_MAX_BIT;
-	    data_sel_bit++) {
+	for (data_sel_t data_sel = 0; data_sel < DATA_SEL_MAX_BIT; data_sel++) {
 		const sample_t *sample;
 		unsigned j;
 
-		if (!(vis->data_sel & (1 << data_sel_bit)))
+		if (!(vis->data_sel_mask & (1 << data_sel)))
 			continue;
 		for (j = 0, sample = list_tail(&vis->samples);
 		    j < num_samples && sample != NULL;
 		    j++, sample = list_prev(&vis->samples, sample)) {
-			double data_val = data_get(sample, data_sel_bit);
+			double data_val = data_get(sample, data_sel);
 			if (isnan(data_val))
 				break;
 			minval = MIN(minval, data_val);
@@ -180,17 +247,15 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 	cairo_move_to(cr, MARGIN, MAKE_Y(0));
 	cairo_line_to(cr, w - MARGIN, MAKE_Y(0));
 	cairo_stroke(cr);
-	cairo_set_font_size(cr, 15);
 	/*
 	 * Now render the actual data samples.
 	 */
-	for (int data_sel_bit = 0; data_sel_bit < DATA_SEL_MAX_BIT;
-	    data_sel_bit++) {
+	for (data_sel_t data_sel = 0; data_sel < DATA_SEL_MAX_BIT; data_sel++) {
 		sample_t *sample;
 		unsigned j;
 		double data_val;
 
-		if (!(vis->data_sel & (1 << data_sel_bit)))
+		if (!(vis->data_sel_mask & (1 << data_sel)))
 			continue;
 
 		sample = list_tail(&vis->samples);
@@ -198,15 +263,15 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 			continue;
 
 		cairo_new_path(cr);
-		cairo_set_source_rgb(cr, colors[data_sel_bit][0],
-		    colors[data_sel_bit][1], colors[data_sel_bit][2]);
+		cairo_set_source_rgb(cr, colors[data_sel][0],
+		    colors[data_sel][1], colors[data_sel][2]);
 
-		data_val = data_get(sample, data_sel_bit);
+		data_val = data_get(sample, data_sel);
 
 		cairo_move_to(cr, w - MARGIN, MAKE_Y(data_val));
 		for (j = 0; j < num_samples && sample != NULL;
 		    j++, sample = list_prev(&vis->samples, sample)) {
-			data_val = data_get(sample, data_sel_bit);
+			data_val = data_get(sample, data_sel);
 			if (isnan(data_val))
 				break;
 			cairo_line_to(cr, w - MARGIN - j * PX_PER_STEP,
@@ -225,8 +290,7 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 	/*
 	 * And finally draw the data labels.
 	 */
-	for (int data_sel_bit = 0; data_sel_bit < DATA_SEL_MAX_BIT;
-	    data_sel_bit++) {
+	for (data_sel_t data_sel = 0; data_sel < DATA_SEL_MAX_BIT; data_sel++) {
 		sample_t *sample;
 		double data_val;
 		char buf[64];
@@ -235,18 +299,18 @@ render_cb(cairo_t *cr, unsigned w, unsigned h, void *userinfo)
 		if (sample == NULL)
 			continue;
 
-		if (vis->data_sel & (1 << data_sel_bit)) {
-			cairo_set_source_rgb(cr, colors[data_sel_bit][0],
-			    colors[data_sel_bit][1], colors[data_sel_bit][2]);
+		if (vis->data_sel_mask & (1 << data_sel)) {
+			cairo_set_source_rgb(cr, colors[data_sel][0],
+			    colors[data_sel][1], colors[data_sel][2]);
 		} else {
 			cairo_set_source_rgb(cr, 0.67, 0.67, 0.67);
 		}
-		data_val = data_get(sample, data_sel_bit);
+		data_val = data_get(sample, data_sel);
 
 		snprintf(buf, sizeof (buf), "%s: %f",
-		    data_sel_names[data_sel_bit], data_val);
+		    data_sel_names[data_sel], data_val);
 		cairo_move_to(cr, 1.5 * MARGIN,
-		    1.5 * MARGIN + data_sel_bit * LINE_HEIGHT);
+		    1.5 * MARGIN + data_sel * LINE_HEIGHT);
 		cairo_show_text(cr, buf);
 	}
 }
@@ -284,8 +348,8 @@ pidvis_new(const char *title, pid_ctl_t *pid, mt_cairo_uploader_t *mtul)
 	XPLMCreateWindow_t cr = {
 	    .structSize = sizeof (cr),
 	    .left = 100,
-	    .top = 400,
-	    .right = 400,
+	    .top = 500,
+	    .right = 500,
 	    .bottom = 100,
 	    .drawWindowFunc = draw_cb,
 	    .decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle,
@@ -296,11 +360,14 @@ pidvis_new(const char *title, pid_ctl_t *pid, mt_cairo_uploader_t *mtul)
 	ASSERT(title != NULL);
 	ASSERT(pid != NULL);
 
-	vis->data_sel = DATA_SEL_ERR_P | DATA_SEL_ERR_I  | DATA_SEL_ERR_D;
+	vis->data_sel_mask = (1 << DATA_SEL_P) | (1 << DATA_SEL_I) |
+	    (1 << DATA_SEL_D);
+	fdr_find(&vis->sim_speed_dr, "sim/time/sim_speed");
+	XPLMRegisterFlightLoopCallback(floop_cb, -1, vis);
 	vis->pid = pid;
 	vis->mtul = mtul;
 	vis->win = XPLMCreateWindowEx(&cr);
-	XPLMSetWindowResizingLimits(vis->win, 200, 200, 1000000, 1000000);
+	XPLMSetWindowResizingLimits(vis->win, 300, 300, 1000000, 1000000);
 	XPLMSetWindowTitle(vis->win, title);
 	list_create(&vis->samples, sizeof (sample_t), offsetof(sample_t, node));
 	ASSERT(vis->win != NULL);
@@ -317,6 +384,7 @@ pidvis_destroy(pidvis_t *vis)
 
 	if (vis == NULL)
 		return;
+	XPLMUnregisterFlightLoopCallback(floop_cb, vis);
 	if (vis->win != NULL)
 		XPLMDestroyWindow(vis->win);
 	if (vis->mtcr != NULL)
