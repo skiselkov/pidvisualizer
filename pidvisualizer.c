@@ -126,15 +126,15 @@ data_get(const sample_t *sample, data_sel_t data_sel)
 	case DATA_SEL_P:
 		return (pid->k_p * pid->e_prev);
 	case DATA_SEL_I:
-		return (pid->k_i * pid->e_integ);
+		return (pid->k_i * pid->integ);
 	case DATA_SEL_D:
-		return (pid->k_d * pid->e_deriv);
+		return (pid->k_d * pid->deriv);
 	case DATA_SEL_E_P:
 		return (pid->e_prev);
 	case DATA_SEL_E_I:
-		return (pid->e_integ);
+		return (pid->integ);
 	case DATA_SEL_E_D:
-		return (pid->e_deriv);
+		return (pid->deriv);
 	case DATA_SEL_K_P:
 		return (pid->k_p);
 	case DATA_SEL_K_I:
