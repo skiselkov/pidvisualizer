@@ -124,11 +124,11 @@ data_get(const sample_t *sample, data_sel_t data_sel)
 
 	switch (data_sel) {
 	case DATA_SEL_P:
-		return (pid->k_p * pid->e_prev);
+		return (pid->k_p * pid->k_p_gain * pid->e_prev);
 	case DATA_SEL_I:
-		return (pid->k_i * pid->integ);
+		return (pid->k_i * pid->k_i_gain * pid->integ);
 	case DATA_SEL_D:
-		return (pid->k_d * pid->deriv);
+		return (pid->k_d * pid->k_d_gain * pid->deriv);
 	case DATA_SEL_E_P:
 		return (pid->e_prev);
 	case DATA_SEL_E_I:
